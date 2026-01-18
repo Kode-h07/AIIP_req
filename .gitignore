@@ -1,0 +1,13 @@
+# Django / SQLite
+db.sqlite3
+
+# Virtual environment
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Env secrets
+.env
