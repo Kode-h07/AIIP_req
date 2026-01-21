@@ -7,6 +7,15 @@ from crawler.services.pdf_extract import extract_pdf_text_first_pages
 from crawler.services.llm_gemini import gemini_validate
 from crawler.services.llm_openai import openai_validate
 
+def _has_court_litigation_signal(text: str) -> bool:
+    blob = (text or "").lower()
+    court_tokens = [
+        " v. ", " vs. ", "lawsuit", "court", "judge", "ruling", "verdict",
+        "litigation", "appeal", "supreme court", "district court",
+        "complaint", "plaintiff", "defendant", "injunction",
+        "class action", "settlement",
+    ]
+    return any(tok in blob for tok in court_tokens)
 
 def validate_candidate_recent_aiip(
     *,
@@ -106,16 +115,7 @@ def validate_candidate_recent_aiip(
         " defendant",
     ]
 
-    if any(tok in text_blob for tok in court_tokens):
-        return {
-            "keep": False,
-            "published_at": ev.dt,
-            "published_at_source": ev.source,
-            "published_at_raw": ev.raw,
-            "gemini": None,
-            "openai": None,
-            "reason": "filtered: court/litigation-focused content",
-        }
+    
 
     for kw in [
         "copyright",
@@ -192,7 +192,14 @@ def validate_candidate_recent_aiip(
             "gemini": g,
             "openai": o,
             "reason": "not AI×IP (gemini/openai/keywords all failed)",
+            "tags": [],
         }
+
+    text_blob = " ".join([
+        title or "",
+        (evidence.get("pdf_text_excerpt") or ""),
+    ])
+    is_litigation = _has_court_litigation_signal(text_blob)
 
     return {
         "keep": True,
@@ -202,4 +209,5 @@ def validate_candidate_recent_aiip(
         "gemini": g,
         "openai": o,
         "reason": "ok",
+        "tags": (["court/litigation"] if is_litigation else []),
     }

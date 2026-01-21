@@ -1,58 +1,27 @@
+import os
 from django.core.management.base import BaseCommand, CommandError
-from django.conf import settings
 
-from crawler.services.email_digest import send_weekly_digest
+from crawler.services.email_digest import send_raw_email
 
 
 class Command(BaseCommand):
-    help = "Send digest email manually for testing. Uses env/settings recipient automatically."
-
-    def add_arguments(self, parser):
-        parser.add_argument(
-            "--days",
-            type=int,
-            default=getattr(settings, "CRAWLER_RECENCY_DAYS", 10),
-            help="Recency window in days (default: settings.CRAWLER_RECENCY_DAYS or 10)",
-        )
-        parser.add_argument(
-            "--limit",
-            type=int,
-            default=40,
-            help="Max number of items to send (default: 40)",
-        )
-        parser.add_argument(
-            "--dry-run",
-            action="store_true",
-            help="Do not send; just print how many would be sent.",
-        )
+    help = "Send a test email using .env variables DIGEST_TO_EMAIL / DIGEST_FROM_EMAIL"
 
     def handle(self, *args, **options):
-        days = options["days"]
-        limit = options["limit"]
-        dry_run = options["dry_run"]
+        to_email = (os.getenv("DIGEST_TO_EMAIL") or "").strip()
+        from_email = (os.getenv("DIGEST_FROM_EMAIL") or os.getenv("EMAIL_HOST_USER") or "").strip()
 
-        # Use settings / env email automatically
-        recipient = getattr(settings, "DIGEST_TO_EMAIL", None)
-        if not recipient:
-            raise CommandError(
-                "DIGEST_TO_EMAIL is not set in settings.py or environment."
-            )
+        if not to_email:
+            raise CommandError("DIGEST_TO_EMAIL is not set in .env")
+        if not from_email:
+            raise CommandError("DIGEST_FROM_EMAIL (or EMAIL_HOST_USER) is not set in .env")
 
-        self.stdout.write(f"[EMAIL] Using recipient from settings: {recipient}")
-
-        if dry_run:
-            self.stdout.write(
-                self.style.WARNING(
-                    f"[DRY RUN] Would send digest to {recipient} (days={days}, limit={limit})"
-                )
-            )
-            return
+        subject = "[TEST] AI × IP Digest Email Test"
+        body = "This is a test email. If you received it, SMTP settings are working."
 
         try:
-            n = send_weekly_digest(days=days, limit=limit)
+            send_raw_email(subject=subject, body=body, to_email=to_email, from_email=from_email)
         except Exception as e:
             raise CommandError(f"Email send failed: {e}")
 
-        self.stdout.write(
-            self.style.SUCCESS(f"Sent digest successfully. items_sent={n}")
-        )
+        self.stdout.write(self.style.SUCCESS(f"Test email sent to {to_email}"))

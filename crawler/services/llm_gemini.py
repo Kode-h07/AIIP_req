@@ -1,87 +1,121 @@
+# crawler/services/llm_gemini.py
 import json
 import os
+from typing import Dict, Any, Optional
+
 import httpx
 
 
-def gemini_validate(evidence: dict) -> dict:
-    """
-    Content-only validation (NO date/recency judgement by LLM).
-    More generous AI×IP topicality.
-    Excludes court/litigation-focused items.
-    Returns:
-      { "is_ai_ip_report": bool, "confidence": float, "reason": str }
-    """
+def _list_models(api_key: str) -> list[dict]:
+    url = "https://generativelanguage.googleapis.com/v1beta/models"
+    with httpx.Client(timeout=20.0) as client:
+        r = client.get(url, params={"key": api_key})
+    r.raise_for_status()
+    return r.json().get("models", []) or []
+
+
+def _pick_model(models: list[dict]) -> Optional[str]:
+    usable = []
+    for m in models:
+        name = (m.get("name") or "").strip()  # e.g. "models/gemini-1.5-pro"
+        methods = m.get("supportedGenerationMethods") or []
+        if "generateContent" in methods and name.startswith("models/"):
+            usable.append(name)
+
+    if not usable:
+        return None
+
+    # preference order
+    pref = [
+        "models/gemini-1.5-flash",
+        "models/gemini-1.5-pro",
+        "models/gemini-1.0-pro",
+    ]
+    for p in pref:
+        if p in usable:
+            return p
+
+    return usable[0]
+
+
+def gemini_validate(evidence: Dict[str, Any]) -> Dict[str, Any]:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not set")
+
+    # Optional override (if set), otherwise auto-pick
+    override = (os.getenv("GEMINI_MODEL") or "").strip()
+    if override and not override.startswith("models/"):
+        override = "models/" + override
+
+    models = _list_models(api_key)
+    picked = _pick_model(models)
+    model_name = override or picked
+
+    if not model_name:
         return {
             "is_ai_ip_report": False,
-            "confidence": 0.0,
-            "reason": "Gemini error: GEMINI_API_KEY missing",
+            "is_recent_10d": False,
+            "best_date_iso": None,
+            "reason": "Gemini: no usable model found (generateContent unsupported)",
         }
-
-    # Allow overriding model via env; choose a safer default.
-    model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-latest")
 
     prompt = f"""
-Return ONLY valid JSON:
-{{
-  "is_ai_ip_report": boolean,
-  "confidence": number,
-  "reason": string
-}}
+You validate whether a candidate PDF/report is (1) AI + Intellectual Property policy/law/guidance/report
+and (2) recent within 10 days of today.
 
-Goal: Decide if this is an AI × Intellectual Property (IP) POLICY/GUIDANCE/REPORT type item.
-Be GENEROUS.
+Be generous on AI×IP relevance (copyright, patent, trademark, trade secrets, licensing, training data, TDM, IP office guidance).
+Court/litigation analyses are allowed if they discuss broader policy/guidance/compliance implications.
 
-Mark true if it meaningfully relates to:
-- AI / generative AI / ML / training data / model outputs / synthetic media
-AND
-- IP or adjacent policy topics: copyright, patents (inventorship/eligibility),
-  trademarks, trade secrets, licensing/collective licensing, TDM/database rights,
-  regulatory guidance, agency frameworks, consultations, white papers.
+Return ONLY JSON with keys:
+- is_ai_ip_report (boolean)
+- is_recent_10d (boolean)
+- best_date_iso (string YYYY-MM-DD or null)
+- reason (string, short)
 
-IMPORTANT EXCLUDE:
-- Court cases, lawsuits, litigation summaries, rulings/verdicts, case-law analysis.
-If the item is primarily about a specific court case or lawsuit, return false.
+Today: {evidence.get("today_iso")}
+Title: {evidence.get("title")}
+Source: {evidence.get("source_name")}
+Landing page: {evidence.get("landing_page_url")}
+PDF: {evidence.get("pdf_url")}
+Landing page date evidence: {evidence.get("landing_page_date_iso")} ({evidence.get("landing_page_date_source")} | {evidence.get("landing_page_date_raw")})
 
-Do NOT judge recency or dates.
-
-Evidence:
-{json.dumps(evidence, ensure_ascii=False)}
+PDF excerpt:
+{(evidence.get("pdf_text_excerpt") or "")[:2000]}
 """.strip()
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-
-    body = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2},
+    url = f"https://generativelanguage.googleapis.com/v1beta/{model_name}:generateContent"
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 400},
     }
 
-    try:
-        with httpx.Client(timeout=25) as client:
-            resp = client.post(url, json=body)
-            resp.raise_for_status()
-            data = resp.json()
+    with httpx.Client(timeout=30.0) as client:
+        r = client.post(url, params={"key": api_key}, json=payload)
 
-        # Extract text output
-        text = ""
-        try:
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-        except Exception:
-            text = ""
-
-        text = (text or "").strip()
-        parsed = json.loads(text)
-
-        return {
-            "is_ai_ip_report": bool(parsed.get("is_ai_ip_report", False)),
-            "confidence": float(parsed.get("confidence", 0.0) or 0.0),
-            "reason": str(parsed.get("reason", ""))[:400],
-        }
-
-    except Exception as e:
+    if r.status_code >= 400:
         return {
             "is_ai_ip_report": False,
-            "confidence": 0.0,
-            "reason": f"Gemini error: {e}",
+            "is_recent_10d": False,
+            "best_date_iso": None,
+            "reason": f"Gemini HTTP {r.status_code} model={model_name}: {r.text[:180]}",
+        }
+
+    data = r.json()
+    text = (
+        data.get("candidates", [{}])[0]
+        .get("content", {})
+        .get("parts", [{}])[0]
+        .get("text", "")
+        or ""
+    ).strip()
+
+    try:
+        return json.loads(text)
+    except Exception:
+        return {
+            "is_ai_ip_report": False,
+            "is_recent_10d": False,
+            "best_date_iso": None,
+            "reason": f"Gemini non-JSON model={model_name}: {text[:180]}",
         }

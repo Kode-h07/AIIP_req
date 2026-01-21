@@ -12,6 +12,7 @@ from crawler.services.source_infer import infer_source
 from crawler.services.validate_candidate import validate_candidate_recent_aiip
 from crawler.services.store import upsert_recent_report
 from crawler.models import ReportItem
+from crawler.services.pdf_filters import is_cross_domain_pdf, is_junk_pdf
 
 
 # -------------------------
@@ -181,14 +182,17 @@ class Command(BaseCommand):
                         # (C) Validate + save FIRST passing PDF for this query
                         # -------------------------
                         for c in pdf_candidates:
-                            pdf_url = c.get("report_url")
-                            if not pdf_url:
+                            pdf_url = c["report_url"]
+                            context = (c.get("context") or "") + " " + (c.get("evidence") or "")
+
+                            if is_junk_pdf(pdf_url, context):
+                                self.stdout.write(f"      SKIP(junk_pdf): {pdf_url}")
                                 continue
 
-                            context = c.get("context", "") or ""
-                            if _is_junk_pdf(pdf_url, context):
-                                self.stdout.write(f"      SKIP(junk pdf): {pdf_url}")
+                            if is_cross_domain_pdf(result_url, pdf_url):
+                                self.stdout.write(f"      SKIP(cross_domain_pdf): {pdf_url}")
                                 continue
+
 
                             if ReportItem.objects.filter(report_url=pdf_url).exists():
                                 self.stdout.write(f"      SKIP(dup): {pdf_url}")
@@ -201,6 +205,10 @@ class Command(BaseCommand):
                                 pdf_url=pdf_url,
                                 recency_days=days,
                             )
+                            tags = ver.get("tags") or []
+                            tag_str = ("[" + ",".join(tags) + "] ") if tags else ""
+                            note = f"{tag_str}{ver.get('reason','')}"
+
 
                             if not ver.get("keep", False):
                                 self.stdout.write(

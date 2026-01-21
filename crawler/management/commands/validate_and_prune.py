@@ -1,3 +1,4 @@
+# crawler/management/commands/validate_and_prune.py
 from datetime import timedelta
 from django.core.management.base import BaseCommand
 from django.utils import timezone
@@ -11,223 +12,165 @@ from crawler.services.llm_gemini import gemini_validate
 from crawler.services.llm_openai import openai_validate
 
 
-def _is_llm_error(resp: dict | None) -> bool:
-    if not resp:
-        return True
-    reason = (resp.get("reason") or "").lower()
-    return ("error" in reason) or ("404" in reason) or ("unexpected keyword" in reason)
-
-
-def build_evidence(it: ReportItem, html: str, pdf_text: str, today_iso: str) -> dict:
-    # date evidence from landing page (strict)
-    ev = extract_published_at_with_evidence(html)
-    landing_date_iso = ev.dt.date().isoformat() if ev else None
-    landing_source = ev.source if ev else None
-    landing_raw = ev.raw if ev else None
-
-    return {
-        "today_iso": today_iso,
-        "title": it.title,
-        "source_name": it.source_name,
-        "landing_page_url": it.landing_page_url,
-        "pdf_url": it.report_url,
-        "landing_page_date_iso": landing_date_iso,
-        "landing_page_date_source": landing_source,
-        "landing_page_date_raw": landing_raw,
-        "pdf_text_excerpt": pdf_text[:2000],
-    }
-
-
 class Command(BaseCommand):
-    help = "Validate AI×IP relevance + recency via Gemini + OpenAI; delete outdated if either says outdated."
+    help = "Validate candidates via LLM and prune outdated ones. Never crash on network errors."
 
     def handle(self, *args, **options):
         days = getattr(settings, "CRAWLER_RECENCY_DAYS", 10)
         cutoff = timezone.now() - timedelta(days=days)
-        today_iso = timezone.localtime(timezone.now()).date().isoformat()
 
-        # validate only unsent recent-ish candidates (or all unsent if you prefer)
-        qs = ReportItem.objects.filter(sent_at__isnull=True).order_by(
-            "-published_at", "-id"
-        )[:200]
-        items = list(qs)
+        qs = ReportItem.objects.filter(sent_at__isnull=True).order_by("-id")[:200]
+        self.stdout.write(f"[VALIDATE] candidates={qs.count()}")
 
-        self.stdout.write(f"[VALIDATE] candidates={len(items)}")
-
-        deleted = 0
         kept = 0
+        deleted = 0
+        skipped = 0
 
-        for it in items:
-            # Fetch landing page
-            try:
-                code, html = fetch_html(it.landing_page_url or "")
-            except Exception as e:
-                self.stdout.write(
-                    self.style.WARNING(
-                        f"SKIP(landing fetch error): {it.landing_page_url} | {e}"
-                    )
-                )
-                continue
-
-            if code >= 400 or not html:
-                self.stdout.write(
-                    self.style.WARNING(
-                        f"SKIP(landing fetch HTTP {code}): {it.landing_page_url}"
-                    )
-                )
-                continue
-
-            if code >= 400 or not html:
-                # no evidence -> delete (cannot verify recency)
+        for it in qs:
+            # If there's a published_at and it's already old, prune quickly
+            if it.published_at and it.published_at < cutoff:
                 it.delete()
                 deleted += 1
-                self.stdout.write(
-                    f"DELETE (no landing page) {it.landing_page_url} HTTP {code}"
-                )
+                self.stdout.write(f"DELETE (db published_at older than {days}d) {it.report_url}")
                 continue
 
-            # Strict: must find landing-page date evidence
+            landing_url = (it.landing_page_url or "").strip()
+            pdf_url = (it.report_url or "").strip()
+
+            # 1) Fetch landing page HTML for date evidence (strict, but do not crash)
+            try:
+                code, html = fetch_html(landing_url)
+            except Exception as e:
+                skipped += 1
+                self.stdout.write(self.style.WARNING(f"SKIP(landing fetch error): {landing_url} | {e}"))
+                continue
+
+            if code >= 400 or not html:
+                skipped += 1
+                self.stdout.write(self.style.WARNING(f"SKIP(landing fetch HTTP {code}): {landing_url}"))
+                continue
+
             ev = extract_published_at_with_evidence(html)
             if not ev:
-                it.delete()
-                deleted += 1
-                self.stdout.write(
-                    f"DELETE (no landing-page date evidence) {it.landing_page_url}"
-                )
+                # Do NOT delete; keep but mark that date evidence not found
+                kept += 1
+                self.stdout.write(f"KEEP (no_date_evidence) {pdf_url}")
                 continue
 
-            # Optional: prefilter by your extracted date (fast gate)
             if ev.dt < cutoff:
                 it.delete()
                 deleted += 1
-                self.stdout.write(
-                    f"DELETE (landing page date older than {days}d) {it.landing_page_url}"
-                )
+                self.stdout.write(f"DELETE (landing page date older than {days}d) {landing_url}")
                 continue
 
-            # Fetch PDF and extract some text evidence
+            # 2) Fetch PDF (optional) for text excerpt; do not crash on errors
+            pdf_text = ""
             try:
-                try:
-                    pcode, pdf_bytes = fetch_pdf(it.report_url or "")
-                except Exception as e:
-                    self.stdout.write(
-                        self.style.WARNING(
-                            f"SKIP(pdf fetch error): {it.report_url} | {e}"
-                        )
-                    )
-                    continue
-
-                if pcode >= 400 or not pdf_bytes:
-                    self.stdout.write(
-                        self.style.WARNING(
-                            f"SKIP(pdf fetch HTTP {pcode}): {it.report_url}"
-                        )
-                    )
-                    continue
-
+                pcode, pdf_bytes = fetch_pdf(pdf_url)
             except Exception as e:
-                self.stdout.write(
-                    self.style.WARNING(f"SKIP(pdf fetch): {it.report_url} | {e}")
-                )
+                skipped += 1
+                self.stdout.write(self.style.WARNING(f"SKIP(pdf fetch error): {pdf_url} | {e}"))
                 continue
 
-            pdf_text = (
-                extract_pdf_text_first_pages(pdf_bytes, max_pages=2)
-                if (pcode < 400 and pdf_bytes)
-                else ""
-            )
+            if pcode >= 400 or not pdf_bytes:
+                skipped += 1
+                self.stdout.write(self.style.WARNING(f"SKIP(pdf fetch HTTP {pcode}): {pdf_url}"))
+                continue
 
-            evidence = build_evidence(it, html, pdf_text, today_iso)
-
-            # Dual LLM validation (CONTENT-ONLY; no recency judgement here)
             try:
-                g = gemini_validate(
-                    evidence
-                )  # expects: {is_ai_ip_report, confidence?, reason}
+                pdf_text = extract_pdf_text_first_pages(pdf_bytes, max_pages=2)
+            except Exception:
+                pdf_text = ""
+
+            evidence = {
+                "today_iso": timezone.localtime(timezone.now()).date().isoformat(),
+                "title": it.title or "",
+                "source_name": it.source_name or "",
+                "landing_page_url": landing_url,
+                "pdf_url": pdf_url,
+                "landing_page_date_iso": ev.dt.date().isoformat(),
+                "landing_page_date_source": ev.source,
+                "landing_page_date_raw": ev.raw,
+                "pdf_text_excerpt": (pdf_text or "")[:2000],
+            }
+
+            # 3) Dual LLM validation — but NEVER delete solely because LLM failed
+            g_err = None
+            o_err = None
+
+            try:
+                g = gemini_validate(evidence)
             except Exception as e:
+                g_err = str(e)
                 g = {
                     "is_ai_ip_report": False,
-                    "confidence": 0.0,
+                    "is_recent_10d": False,
+                    "best_date_iso": None,
                     "reason": f"Gemini error: {e}",
                 }
 
             try:
-                o = openai_validate(
-                    evidence
-                )  # expects: {is_ai_ip_report, confidence?, reason}
+                o = openai_validate(evidence)
             except Exception as e:
+                o_err = str(e)
                 o = {
                     "is_ai_ip_report": False,
-                    "confidence": 0.0,
+                    "is_recent_10d": False,
+                    "best_date_iso": None,
                     "reason": f"OpenAI error: {e}",
                 }
 
-            def _is_llm_error(resp: dict | None) -> bool:
-                if not resp:
-                    return True
-                r = (resp.get("reason") or "").lower()
-                return (
-                    "gemini error" in r
-                    or "openai error" in r
-                    or "unexpected keyword" in r
-                    or "404" in r
-                    or "not found" in r
-                )
+            # --- UPDATED DECISION RULE (fix your 'items_sent=0' situation) ---
+            # Authoritative recency gate is the landing page evidence we already extracted.
+            # LLM is used as topical check and as a secondary signal; never hard-delete on LLM failure.
 
-            g_err = _is_llm_error(g)
-            o_err = _is_llm_error(o)
+            llm_failed = bool(g_err or o_err) or ("non-JSON" in (g.get("reason", "") + o.get("reason", "")))
 
-            # If BOTH LLMs errored, DO NOT delete (unknown). Keep item.
-            if g_err and o_err:
+            # Filter out litigation/court-heavy content softly (keywords); keep conservative
+            text_blob = (it.title or "").lower() + " " + (pdf_text or "").lower()
+            court_tokens = [
+                "v.", "vs.", "lawsuit", "court", "judge", "ruling", "verdict",
+                "litigation", "appeal", "supreme court", "district court",
+                "complaint", "plaintiff", "defendant"
+            ]
+            if any(tok in text_blob for tok in court_tokens):
+                # Not deleting; just skip inclusion logic by marking as not AI×IP
                 it.ai_ip_verified = False
-                it.ai_ip_score = 0
-                it.ai_ip_reason = f"G:{g.get('reason','')} | O:{o.get('reason','')}"[
-                    :500
-                ]
+                it.ai_ip_reason = "filtered: court/litigation-focused content"
                 it.verified_at = timezone.now()
-                it.save(
-                    update_fields=[
-                        "ai_ip_verified",
-                        "ai_ip_score",
-                        "ai_ip_reason",
-                        "verified_at",
-                    ]
-                )
+                it.save(update_fields=["ai_ip_verified", "ai_ip_reason", "verified_at"])
                 kept += 1
-                self.stdout.write(f"KEEP (llm_failed) {it.report_url}")
+                self.stdout.write(f"KEEP (court_filtered) {pdf_url}")
                 continue
 
-            # CONTENT decision (lighter gate):
-            # - If any successful LLM explicitly says NOT AI×IP -> delete
-            # - Otherwise keep if either LLM says AI×IP
-            gemini_ok = None if g_err else bool(g.get("is_ai_ip_report", False))
-            openai_ok = None if o_err else bool(o.get("is_ai_ip_report", False))
-
-            if (gemini_ok is False) or (openai_ok is False):
-                it.delete()
-                deleted += 1
-                self.stdout.write(
-                    f"DELETE (not AI×IP) {it.report_url}\n  Gemini: {g}\n  OpenAI: {o}"
-                )
+            # If LLM failed, keep item but do not mark verified
+            if llm_failed:
+                it.ai_ip_verified = False
+                it.ai_ip_reason = f"llm_failed | G:{g.get('reason','')} | O:{o.get('reason','')}"[:500]
+                it.verified_at = timezone.now()
+                it.save(update_fields=["ai_ip_verified", "ai_ip_reason", "verified_at"])
+                kept += 1
+                self.stdout.write(f"KEEP (llm_failed) {pdf_url}")
                 continue
 
-            keep_aiip = (gemini_ok is True) or (openai_ok is True)
+            # If either says NOT recent, do NOT delete (recency already proven by landing date).
+            # We only use LLM recency as advisory now.
+            is_aiip = bool(g.get("is_ai_ip_report", False) or o.get("is_ai_ip_report", False))  # generous OR
+            if not is_aiip:
+                it.ai_ip_verified = False
+                it.ai_ip_reason = f"not_ai_ip | G:{g.get('reason','')} | O:{o.get('reason','')}"[:500]
+                it.verified_at = timezone.now()
+                it.save(update_fields=["ai_ip_verified", "ai_ip_reason", "verified_at"])
+                kept += 1
+                self.stdout.write(f"KEEP (not_ai_ip) {pdf_url}")
+                continue
 
-            # Keep: mark verification fields
-            it.ai_ip_verified = bool(keep_aiip)
-            it.ai_ip_score = int(
-                (50 if gemini_ok is True else 0) + (50 if openai_ok is True else 0)
-            )
-            it.ai_ip_reason = f"G:{g.get('reason','')} | O:{o.get('reason','')}"[:500]
+            # Mark verified
+            it.ai_ip_verified = True
+            it.ai_ip_reason = f"ok | G:{g.get('reason','')} | O:{o.get('reason','')}"[:500]
             it.verified_at = timezone.now()
-            it.save(
-                update_fields=[
-                    "ai_ip_verified",
-                    "ai_ip_score",
-                    "ai_ip_reason",
-                    "verified_at",
-                ]
-            )
-
+            it.save(update_fields=["ai_ip_verified", "ai_ip_reason", "verified_at"])
             kept += 1
-            self.stdout.write(f"KEEP {it.report_url}")
+            self.stdout.write(f"KEEP (verified) {pdf_url}")
+
+        self.stdout.write(self.style.SUCCESS(f"[VALIDATE] kept={kept} deleted={deleted} skipped={skipped}"))
